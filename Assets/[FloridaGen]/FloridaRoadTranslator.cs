@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 
-namespace DeadEverywhere.FloridaGen
+namespace DeadEverywhere.FloridaGeneration
 {
     // ═════════════════════════════════════════════════════════════════════════
     //  Road design standards
@@ -188,6 +188,8 @@ namespace DeadEverywhere.FloridaGen
         public float deckClosingRadius = 400f;
         /// <summary>Height (m) of the road surface above the terrain surface.</summary>
         public float surfaceOffset = 0.06f;
+        /// <summary>Extra width in 0.0001 multiples of the mapped/default width; 0 preserves it.</summary>
+        public float widthAdjustment = 0f;
         /// <summary>World Y of the terrain surface at world (x, z).  Must clamp outside the terrain.</summary>
         public Func<float, float, float> groundHeight;
     }
@@ -495,7 +497,7 @@ namespace DeadEverywhere.FloridaGen
                 kind         = kind,
                 layer        = layer,
                 category     = FloridaRoadStandards.Category(r.highway),
-                halfWidth    = FloridaRoadStandards.HalfWidth(r),
+                halfWidth    = FloridaRoadStandards.HalfWidth(r) * (1f + Mathf.Max(0f, cfg.widthAdjustment) * 0.0001f),
                 maxGrade     = FloridaRoadStandards.MaxGrade(r.highway),
                 deckDepth    = FloridaRoadStandards.DeckDepth(r.highway),
                 tunnelHeight = FloridaRoadStandards.TunnelHeight(r.highway),

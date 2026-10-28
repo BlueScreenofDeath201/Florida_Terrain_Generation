@@ -2,7 +2,7 @@ using System;
 using UnityEditor;
 using UnityEngine;
 
-namespace DeadEverywhere.FloridaGen.FloridaGenEditor
+namespace DeadEverywhere.FloridaGeneration
 {
     /// <summary>
     /// Inspector for <see cref="FloridaWorldGenerator"/>: type a chunk (x, y) and run the whole pipeline
@@ -22,6 +22,7 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
             serializedObject.Update();
             EditorGUILayout.PropertyField(serializedObject.FindProperty("chunkX"));
             EditorGUILayout.PropertyField(serializedObject.FindProperty("chunkY"));
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("roadWidthAdjustment"));
             serializedObject.ApplyModifiedProperties();
 
             DrawStepButtons(world);

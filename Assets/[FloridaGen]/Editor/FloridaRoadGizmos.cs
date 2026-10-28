@@ -4,7 +4,7 @@ using System.Runtime.CompilerServices;
 using UnityEditor;
 using UnityEngine;
 
-namespace DeadEverywhere.FloridaGen.FloridaGenEditor
+namespace DeadEverywhere.FloridaGeneration
 {
     /// <summary>
     /// Scene-view gizmos for everything the Florida generator knows about a chunk beyond the
@@ -16,8 +16,8 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
     /// Geometry is built once per data set into <c>Vector3[]</c> arrays and drawn with a few
     /// <see cref="Handles.DrawLines(Vector3[])"/> calls; labels are culled by distance from the
     /// Scene-view camera.  Each group is rebuilt only when the object it was built from
-    /// (the cached <see cref="RoadPlan"/>, or an OSM data array) is replaced, or after
-    /// <see cref="Invalidate"/> (the inspector's "Rebuild Road Plan" button calls it).
+    /// (the cached <see cref="RoadPlan"/>, or an OSM data array) is replaced, the terrain
+    /// changes, or after <see cref="Invalidate"/>.
     /// </summary>
     internal static class FloridaRoadGizmos
     {
@@ -53,7 +53,8 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
         private sealed class Group
         {
             public object key;
-            public float  terrainY;
+            public TerrainData terrainData;
+            public Vector3 terrainPosition, terrainSize;
             public readonly List<Line>  lines  = new List<Line>();
             public readonly List<Label> labels = new List<Label>();
             public readonly List<(Vector3 center, Color color)> discs = new List<(Vector3, Color)>();
@@ -154,17 +155,22 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
 
         /// <summary>
         /// Returns the cached group when it was built from the same <paramref name="key"/> (and
-        /// optional <paramref name="key2"/>) at the same terrain height; otherwise builds it.
+        /// optional <paramref name="key2"/>) on the same terrain; otherwise builds it.
         /// </summary>
         private static Group Fetch(ref Group slot, object key, FloridaTerrainGenerator gen, Func<Group> build,
                                    object key2 = null)
         {
             object composite = key2 == null ? key : (object)Tuple.Create(key, key2);
-            float y = gen.transform.position.y;
-            if (slot != null && slot.terrainY == y && SameKey(slot.key, composite)) return slot;
+            var data = gen.GetComponent<Terrain>()?.terrainData;
+            var position = gen.transform.position;
+            var size = data != null ? data.size : Vector3.zero;
+            if (slot != null && slot.terrainData == data && slot.terrainPosition == position &&
+                slot.terrainSize == size && SameKey(slot.key, composite)) return slot;
             slot = build();
             slot.key = composite;
-            slot.terrainY = y;
+            slot.terrainData = data;
+            slot.terrainPosition = position;
+            slot.terrainSize = size;
             return slot;
         }
 
@@ -603,7 +609,7 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
                     g.labels.Add(new Label
                     {
                         position = new Vector3(c.x, ground + top + 0.5f, c.y),
-                        text = (fromTag ? $"{top:F1} m" : $"~{top:F0} m ({b.levels} levels)") + roof,
+                        text = (fromTag ? $"{top:F1} m (OSM)" : $"~{top:F0} m ({b.levels} levels)") + roof,
                         color = fromTag ? BuildingTagColor : BuildingLevelColor
                     });
                 }
@@ -632,8 +638,8 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
             (OnewayColor,     "One-way direction"),
             (WaterColor,      "Waterways and water bodies (dotted = culvert)"),
             (RailColor,       "Railways (cyan = bridge, dotted = tunnel)"),
-            (BuildingTagColor,   "Building height from the OSM height tag"),
-            (BuildingLevelColor, "Building height estimated from levels (3.2 m each)"),
+            (BuildingTagColor,   "Building height above local terrain from the OSM height tag"),
+            (BuildingLevelColor, "Building height above local terrain estimated from levels (3.2 m each)"),
         };
     }
 }

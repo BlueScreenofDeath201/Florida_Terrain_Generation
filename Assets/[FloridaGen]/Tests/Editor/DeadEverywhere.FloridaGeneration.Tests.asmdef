@@ -1,0 +1,14 @@
+{
+    "name": "DeadEverywhere.FloridaGeneration.Tests",
+    "rootNamespace": "DeadEverywhere.FloridaGeneration.Tests",
+    "references": [
+        "DeadEverywhere.FloridaGeneration",
+        "Unity.Entities",
+        "Unity.Physics",
+        "Unity.Transforms",
+        "Unity.Mathematics",
+        "Unity.Collections"
+    ],
+    "includePlatforms": ["Editor"],
+    "optionalUnityReferences": ["TestAssemblies"]
+}

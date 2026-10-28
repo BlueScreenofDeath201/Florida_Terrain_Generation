@@ -4,7 +4,7 @@ using UnityEditor;
 using UnityEngine;
 
 
-namespace DeadEverywhere.FloridaGen.FloridaGenEditor
+namespace DeadEverywhere.FloridaGeneration
 {
     /// <summary>
     /// Custom inspector for <see cref="FloridaTerrainGenerator"/>.
@@ -50,21 +50,22 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
         private static FloridaTerrainGenerator[] s_AllGenerators = Array.Empty<FloridaTerrainGenerator>();
         private static bool s_CacheDirty = true;
 
-        // ── Per-generator line-pair cache (rebuilt only when OSM data changes) ────
+        // ── Per-generator line-pair cache ─────────────────────────────────────────
         private static readonly Dictionary<EntityId, OsmLineCache> s_LineCache
             = new Dictionary<EntityId, OsmLineCache>();
 
         /// <summary>
         /// Pre-built <c>Handles.DrawLines</c>-ready arrays for one terrain chunk.
-        /// Rebuilt only when <see cref="buildingCount"/> or <see cref="roadCount"/>
-        /// changes, so the per-repaint cost is a simple array lookup + one or a few
-        /// draw calls rather than rebuilding geometry every frame.
+        /// Rebuilt when OSM data or the terrain changes, so the per-repaint cost is a simple
+        /// array lookup + one or a few draw calls rather than rebuilding geometry every frame.
         /// </summary>
         private sealed class OsmLineCache
         {
-            public int   buildingCount;       // invalidation keys
-            public int   roadCount;
-            public float baseY;               // terrain Y at build time
+            public FloridaTerrainGenerator.OsmBuilding[] buildings;
+            public FloridaTerrainGenerator.OsmRoad[] roads;
+            public TerrainData terrainData;
+            public Vector3 terrainPosition, terrainSize;
+            public float baseY;
 
             // All building edges as {start0,end0, start1,end1, …}
             public Vector3[] buildingLines;
@@ -84,6 +85,17 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
             // Mark the scene cache dirty whenever the hierarchy changes so we
             // never call FindObjectsByType inside a repaint callback.
             EditorApplication.hierarchyChanged += () => s_CacheDirty = true;
+            TerrainCallbacks.heightmapChanged += OnTerrainHeightmapChanged;
+        }
+
+        private static void OnTerrainHeightmapChanged(Terrain terrain, RectInt region, bool synched)
+        {
+            if (terrain == null) return;
+            var gen = terrain.GetComponent<FloridaTerrainGenerator>();
+            if (gen == null) return;
+            gen.InvalidateRoadPlan();
+            InvalidateCache(gen);
+            FloridaRoadGizmos.Invalidate(gen);
         }
 
         // ── Instance lifecycle ────────────────────────────────────────────────────
@@ -234,17 +246,23 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
 
         /// <summary>
         /// Returns the cached <see cref="OsmLineCache"/> for <paramref name="gen"/>,
-        /// rebuilding it only when the OSM data has changed.
+        /// rebuilding it when the OSM data or terrain changes.
         /// </summary>
         private static OsmLineCache GetOrBuildCache(FloridaTerrainGenerator gen, float gy)
         {
             var id           = gen.GetEntityId();
             int buildingCount = gen.osmBuildings?.Length ?? 0;
             int roadCount     = gen.osmRoads?.Length    ?? 0;
+            var data = gen.GetComponent<Terrain>()?.terrainData;
+            var position = gen.transform.position;
+            var size = data != null ? data.size : Vector3.zero;
 
             if (s_LineCache.TryGetValue(id, out var existing) &&
-                existing.buildingCount == buildingCount &&
-                existing.roadCount     == roadCount     &&
+                ReferenceEquals(existing.buildings, gen.osmBuildings) &&
+                ReferenceEquals(existing.roads, gen.osmRoads) &&
+                existing.terrainData == data &&
+                existing.terrainPosition == position &&
+                existing.terrainSize == size &&
                 Mathf.Approximately(existing.baseY, gy))
             {
                 return existing;
@@ -252,8 +270,11 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
 
             var cache = new OsmLineCache
             {
-                buildingCount = buildingCount,
-                roadCount     = roadCount,
+                buildings     = gen.osmBuildings,
+                roads         = gen.osmRoads,
+                terrainData   = data,
+                terrainPosition = position,
+                terrainSize   = size,
                 baseY         = gy
             };
 
@@ -278,8 +299,8 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
                     {
                         Vector2 p0 = bldg.footprint[i];
                         Vector2 p1 = bldg.footprint[(i + 1) % n];
-                        bLines[idx++] = new Vector3(p0.x, gy, p0.y);
-                        bLines[idx++] = new Vector3(p1.x, gy, p1.y);
+                        bLines[idx++] = new Vector3(p0.x, gen.TerrainSurfaceY(p0.x, p0.y), p0.y);
+                        bLines[idx++] = new Vector3(p1.x, gen.TerrainSurfaceY(p1.x, p1.y), p1.y);
                     }
                 }
                 cache.buildingLines = bLines;
@@ -538,6 +559,8 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
                 "\u2022 waterways, lakes and the coastline, railways, and traffic nodes " +
                 "(signals, stop signs, crossings, street lights, motorway exits).\n" +
                 "Rivers, canals and railways also set how much clearance a bridge must leave.\n" +
+                "Building footprints follow the terrain. Height markers show height above local ground: " +
+                "OSM-tagged values are not measured here and may be inaccurate; levels are estimates.\n" +
                 "No API key required.  Toggle each gizmo group with the checkboxes in the inspector above, " +
                 "or use Tools \u2192 Florida Terrain for project-wide master toggles.",
                 MessageType.Info);
@@ -602,10 +625,12 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
                 "carved, so a tube follows the surface instead of boring under a hill.\n" +
                 "\u2022 Roads are clipped to this chunk; where a road continues into the next chunk " +
                 "it ends at the shared edge and the neighbour carries it on.\n" +
-                "\u2022 Everything gets a standard MeshCollider (surface, structure and embankment " +
-                "batches). Keep \"Highway Meshes\" inside a SubScene so it is baked into the ECS " +
-                "physics worlds (only the Terrain needs a dedicated ECS collider component).\n\n" +
-                "Material assets are created in Assets/[Tools]/FloridaGen/Materials/ \u2013 " +
+                "\u2022 Every surface, structure and embankment batch gets a standard MeshCollider " +
+                "and an automatic ECS bridge, just like the Terrain. Keep the generated terrain " +
+                "and roads outside SubScenes; their colliders enter every ECS game world at play time.\n" +
+                "\u2022 Road Width Adjustment: 0 keeps existing widths; 1 is 1.0001x (0.01% wider). " +
+                "Regenerate roads after changing it. Save All / Load All retains the setting.\n\n" +
+                "Material assets are created in Assets/[DeadEverywhere]/FloridaGen/Materials/ \u2013 " +
                 "assign any road-surface texture there without re-generating.  " +
                 "After sculpting the terrain, click \"Rebuild Road Plan\" to refresh the gizmos, " +
                 "then regenerate the meshes.",
@@ -694,7 +719,8 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
             EditorGUILayout.HelpBox(
                 "Both files live next to this terrain's TerrainData asset (" + gen.GetDataDirectory() + "):\n" +
                 "\u2022 " + FloridaChunkFile.BuildingFileName(gen.chunkX, gen.chunkY) +
-                " \u2013 building footprints only, for a building generator.\n" +
+                " \u2013 building footprints, levels and height in metres (0 if unknown). " +
+                "Height is appended after the original eight columns.\n" +
                 "\u2022 " + FloridaChunkFile.ChunkFileName(gen.chunkX, gen.chunkY) +
                 " \u2013 Save All: the heightmap, buildings (with all their tags), roads, waterways, " +
                 "railways and nodes. Load All rebuilds the whole chunk from it without the network.\n" +
@@ -841,7 +867,9 @@ namespace DeadEverywhere.FloridaGen.FloridaGenEditor
                 "   The terrain will be downloaded and resized to exactly 1\u202fmile \u00d7 1\u202fmile\n" +
                 "   (1609.344\u202fm \u00d7 1609.344\u202fm) with real USGS elevation data applied.\n\n" +
                 "Data source: USGS 3D Elevation Program (3DEP) \u2014 1/3 arc-second (~10 m) resolution.\n" +
-                "No API key or account required.\n\n" +
+                "No API key or account required. Missing elevation data triggers another source, " +
+                "never a sea-level substitute. If every source fails, the existing terrain and " +
+                "data files are left unchanged.\n\n" +
                 "Tip: Enable \"Auto Position\" to have the terrain automatically moved to the\n" +
                 "correct world-space position so adjacent chunks tile seamlessly.\n\n" +
                 "Tip: \"Save All\" writes the heightmap, buildings and roads to one file next to the " +

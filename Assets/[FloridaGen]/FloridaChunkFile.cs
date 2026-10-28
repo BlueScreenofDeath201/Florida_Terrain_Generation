@@ -1,7 +1,7 @@
 using System;
 using UnityEngine;
 
-namespace DeadEverywhere.FloridaGen
+namespace DeadEverywhere.FloridaGeneration
 {
     /// <summary>
     /// Everything needed to rebuild one terrain chunk without the network: the heightmap
@@ -12,7 +12,7 @@ namespace DeadEverywhere.FloridaGen
     [Serializable]
     public class FloridaChunkData
     {
-        public const int CurrentVersion = 1;
+        public const int CurrentVersion = 3;
 
         public int    version = CurrentVersion;
         public string savedUtc = "";
@@ -26,6 +26,7 @@ namespace DeadEverywhere.FloridaGen
         public float roadDeckSmoothingRadius = 20f;
         public float roadDeckClosingRadius = 400f;
         public float roadSurfaceOffset = 0.06f;
+        public float roadWidthAdjustment = 0f;
 
         /// <summary>
         /// Terrain elevation in metres (world Y, sea level = 0), row-major

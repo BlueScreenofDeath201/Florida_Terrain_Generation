@@ -8,7 +8,7 @@ using UnityEngine;
 using UnityEditor;
 #endif
 
-namespace DeadEverywhere.FloridaGen
+namespace DeadEverywhere.FloridaGeneration
 {
     /// <summary>
     /// Generates a Unity Terrain heightmap from real USGS 3DEP elevation data for
@@ -25,12 +25,13 @@ namespace DeadEverywhere.FloridaGen
     /// USGS elevation data.
     ///
     /// Data sources (tried in order):
-    ///   1. USGS 3DEP WCS – single request, Arc/Info ASCII Grid text format.
-    ///   2. USGS 3DEP ImageServer getSamples REST API – batched JSON.
+    ///   1. USGS 3DEP ImageServer getSamples REST API – batched JSON.
+    ///   2. USGS 3DEP WCS – Arc/Info ASCII Grid text format.
     ///   3. USGS EPQS point query – individual requests at reduced resolution.
     /// </summary>
     [ExecuteInEditMode]
     [RequireComponent(typeof(Terrain))]
+    [RequireComponent(typeof(TerrainEcsColliderAuthoring))]
     public class FloridaTerrainGenerator : MonoBehaviour
     {
         // ── Origin  27°53′02.27″N  82°30′42.40″W ────────────────────────────────
@@ -95,10 +96,16 @@ namespace DeadEverywhere.FloridaGen
         [Tooltip("Show traffic signals, stop signs, crossings, street lights, ramps and other road nodes.")]
         public bool showTrafficNodeGizmos = true;
 
-        [Tooltip("Show building heights (height / levels / roof tags) as vertical lines.")]
+        [Tooltip("Show building heights above local terrain as vertical lines and roof outlines. " +
+                 "Uses the OSM height tag (not measured here), or estimates 3.2 m per level. " +
+                 "Raised building parts start at min_height / building:min_level.")]
         public bool showBuildingHeightGizmos = true;
 
         [Header("Road Generation")]
+        [Tooltip("Extra road width: 0 keeps the mapped/default width; 1 multiplies it by 1.0001 " +
+                 "(0.01% wider), 100 by 1.01. Applies to planning, meshes and both physics colliders.")]
+        [Min(0f)] public float roadWidthAdjustment = 0f;
+
         [Tooltip("Maximum distance (m) between road mesh stations. Smaller follows terrain more closely.")]
         [Range(1f, 25f)] public float roadSampleSpacing = 5f;
 
@@ -183,6 +190,10 @@ namespace DeadEverywhere.FloridaGen
             public string colour = "";
             /// <summary>First of the amenity / shop / tourism / office / leisure tags (what the building is used for).</summary>
             public string usage = "";
+            /// <summary>Compass direction from the exported centre to the nearest road: N, NE, E, SE, S, SW, W, NW, or unknown.</summary>
+            public string nearestRoadDirection = "unknown";
+            /// <summary>Clockwise degrees from north (+Z) towards the nearest road; -1 when no direction can be determined.</summary>
+            public float nearestRoadBearing = -1f;
         }
 
         /// <summary>A road centre-line as world-space XZ points.</summary>
@@ -291,6 +302,28 @@ namespace DeadEverywhere.FloridaGen
 
         // ── Public API ────────────────────────────────────────────────────────────
 
+        private void OnEnable()
+        {
+            if (!Application.isPlaying) return;
+            EnsureTerrainEcsCollider();
+            var roads = transform.Find("Highway Meshes");
+            if (roads == null) return;
+            foreach (var road in roads.GetComponentsInChildren<MeshCollider>(true))
+                if (road.GetComponent<RoadEcsColliderAuthoring>() == null)
+                    road.gameObject.AddComponent<RoadEcsColliderAuthoring>();
+        }
+
+        private TerrainEcsColliderAuthoring EnsureTerrainEcsCollider()
+        {
+            var bridge = GetComponent<TerrainEcsColliderAuthoring>();
+            if (bridge != null) return bridge;
+#if UNITY_EDITOR
+            if (!Application.isPlaying)
+                return Undo.AddComponent<TerrainEcsColliderAuthoring>(gameObject);
+#endif
+            return gameObject.AddComponent<TerrainEcsColliderAuthoring>();
+        }
+
         /// <summary>
         /// Returns the geographic bounding box (WGS-84 decimal degrees) for the
         /// given chunk coordinate pair.
@@ -328,10 +361,10 @@ namespace DeadEverywhere.FloridaGen
         }
 
         /// <summary>
-        /// Called once for every building footprint when OSM data is fetched.
+        /// Called once for every building footprint when OSM data is fetched or loaded.
         /// Override this method (or hook into it from a subclass) to spawn actual
         /// building geometry at generation time.  It is never called during playback
-        /// or scene repaints — only at the moment the OSM data arrives.
+        /// or scene repaints — only after the buildings and roads are available.
         /// </summary>
         /// <param name="footprintPoints">
         /// World-space XZ polygon vertices — the same points used to draw the
@@ -339,6 +372,58 @@ namespace DeadEverywhere.FloridaGen
         /// connects back to the first).
         /// </param>
         protected virtual void OnBuildingFootprintGenerated(Vector2[] footprintPoints) { }
+
+        /// <summary>The vertex-average centre used by the building text export, including any closing vertex.</summary>
+        private static Vector2 BuildingCenter(Vector2[] footprint)
+        {
+            Vector2 center = Vector2.zero;
+            foreach (var point in footprint) center += point;
+            return center / footprint.Length;
+        }
+
+        private static readonly string[] CompassDirections = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+
+        /// <summary>
+        /// Points each building from its exported centre towards the closest point on the fetched
+        /// road centre-lines in world XZ. Missing geometry or a centre within 1 mm of the road has no direction.
+        /// </summary>
+        public void UpdateBuildingRoadDirections()
+        {
+            if (osmBuildings == null) return;
+            foreach (var building in osmBuildings)
+            {
+                if (building == null) continue;
+                building.nearestRoadDirection = "unknown";
+                building.nearestRoadBearing = -1f;
+                if (building.footprint == null || building.footprint.Length < 3 || osmRoads == null) continue;
+
+                Vector2 center = BuildingCenter(building.footprint);
+                Vector2 nearestOffset = Vector2.zero;
+                float nearestDistanceSquared = float.PositiveInfinity;
+                foreach (var road in osmRoads)
+                {
+                    if (road?.points == null || road.points.Length < 2) continue;
+                    for (int i = 0; i < road.points.Length - 1; i++)
+                    {
+                        Vector2 start = road.points[i], segment = road.points[i + 1] - start;
+                        float lengthSquared = segment.sqrMagnitude;
+                        if (lengthSquared <= 0f || float.IsNaN(lengthSquared) || float.IsInfinity(lengthSquared)) continue;
+                        float t = Mathf.Clamp01(Vector2.Dot(center - start, segment) / lengthSquared);
+                        Vector2 offset = start + segment * t - center;
+                        float distanceSquared = offset.sqrMagnitude;
+                        if (float.IsNaN(distanceSquared) || distanceSquared >= nearestDistanceSquared) continue;
+                        nearestDistanceSquared = distanceSquared;
+                        nearestOffset = offset;
+                    }
+                }
+
+                // Allow for projection rounding when the centre lies on the road.
+                if (float.IsPositiveInfinity(nearestDistanceSquared) || nearestDistanceSquared <= 1e-6f) continue;
+                float bearing = Mathf.Repeat(Mathf.Atan2(nearestOffset.x, nearestOffset.y) * Mathf.Rad2Deg, 360f);
+                building.nearestRoadBearing = bearing;
+                building.nearestRoadDirection = CompassDirections[Mathf.FloorToInt((bearing + 22.5f) / 45f) % 8];
+            }
+        }
 
         // ── Editor-only generation methods ────────────────────────────────────────
 #if UNITY_EDITOR
@@ -366,17 +451,18 @@ namespace DeadEverywhere.FloridaGen
 
                 if (elevations == null)
                 {
-                    statusMessage = "Download failed – check the Console for details.";
+                    statusMessage = "Download failed - no complete elevation data. No heightmap was applied " +
+                                    "or data files overwritten; check the Console for details.";
                     return;
                 }
 
                 EditorUtility.DisplayProgressBar(
                     "Florida Terrain Generator", "Applying heightmap to terrain…", 0.92f);
 
-                ApplyToTerrain(elevations);
-
                 if (autoPosition)
                     transform.position = ChunkWorldPosition(chunkX, chunkY);
+
+                ApplyToTerrain(elevations);
 
                 InvalidateRoadPlan();
                 statusMessage = $"Chunk ({chunkX}, {chunkY}) generated  \u2713";
@@ -530,7 +616,7 @@ namespace DeadEverywhere.FloridaGen
                 "Florida Terrain Generator", "Requesting elevation via ArcGIS getSamples…", 0.10f);
             try
             {
-                return FetchViaGetSamples(b, res);
+                return ValidateElevationGrid(FetchViaGetSamples(b, res), res, "getSamples");
             }
             catch (Exception ex)
             {
@@ -544,7 +630,7 @@ namespace DeadEverywhere.FloridaGen
                 "Florida Terrain Generator", "Trying USGS 3DEP WCS…", 0.30f);
             try
             {
-                return FetchViaWCS(b, res);
+                return ValidateElevationGrid(FetchViaWCS(b, res), res, "WCS");
             }
             catch (Exception ex)
             {
@@ -557,7 +643,7 @@ namespace DeadEverywhere.FloridaGen
                 "Falling back to USGS EPQS point queries (slow)…", 0.45f);
             try
             {
-                return FetchViaEPQS(b, res);
+                return ValidateElevationGrid(FetchViaEPQS(b, res), res, "EPQS");
             }
             catch (Exception ex)
             {
@@ -573,7 +659,7 @@ namespace DeadEverywhere.FloridaGen
             "https://elevation.nationalmap.gov/arcgis/services/" +
             "3DEPElevation/ImageServer/WCSServer";
 
-        private float[,] FetchViaWCS(GeoBounds b, int res)
+        protected virtual float[,] FetchViaWCS(GeoBounds b, int res)
         {
             // Discover the real coverage name from GetCapabilities so we are not
             // coupled to a hardcoded name that may differ across service deployments.
@@ -584,7 +670,7 @@ namespace DeadEverywhere.FloridaGen
                 "?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage" +
                 $"&COVERAGE={Uri.EscapeDataString(coverageName)}" +
                 "&CRS=EPSG:4326" +
-                $"&BBOX={b.west:F7},{b.south:F7},{b.east:F7},{b.north:F7}" +
+                string.Format(Inv, "&BBOX={0:F7},{1:F7},{2:F7},{3:F7}", b.west, b.south, b.east, b.north) +
                 $"&WIDTH={res}&HEIGHT={res}" +
                 "&FORMAT=image/x-aaigrid";
 
@@ -642,7 +728,7 @@ namespace DeadEverywhere.FloridaGen
 
         // ── Source 1: ArcGIS ImageServer getSamples ───────────────────────────────
 
-        private float[,] FetchViaGetSamples(GeoBounds b, int res)
+        protected virtual float[,] FetchViaGetSamples(GeoBounds b, int res)
         {
             const string ENDPOINT =
                 "https://elevation.nationalmap.gov/arcgis/rest/services/" +
@@ -664,7 +750,6 @@ namespace DeadEverywhere.FloridaGen
                 }
 
             float[,] result = new float[res, res];
-            int missing = 0;
 
             for (int start = 0; start < points.Count; start += BATCH_SIZE)
             {
@@ -675,37 +760,36 @@ namespace DeadEverywhere.FloridaGen
                     "Florida Terrain Generator",
                     $"Downloading samples {start + 1}–{end} / {points.Count}…", pct);
 
-                // Build esriGeometryMultipoint JSON
-                var sb = new StringBuilder("{\"points\":[");
-                for (int i = start; i < end; i++)
-                {
-                    if (i > start) sb.Append(',');
-                    sb.Append($"[{points[i].lon:F7},{points[i].lat:F7}]");
-                }
-                sb.Append("]}");
-
-                string postBody =
-                    "geometry="    + Uri.EscapeDataString(sb.ToString()) +
-                    "&geometryType=esriGeometryMultipoint" +
-                    "&returnFirstValueOnly=false" +
-                    "&interpolation=RSP_BilinearInterpolation" +
-                    "&f=json";
-
+                string postBody = BuildGetSamplesPostBody(points, start, end);
                 string json = SyncHttpPost(ENDPOINT, postBody, timeoutSeconds: 60);
-                missing += (end - start) - ParseGetSamplesJson(json, points, start, end, result);
+                ParseGetSamplesJson(json, points, start, end, result);
             }
-
-            if (missing > 0)
-                Debug.LogWarning(
-                    $"[FloridaTerrainGenerator] getSamples returned no data for {missing} of {points.Count} " +
-                    "points; they were left at sea level (0 m).");
 
             return result;
         }
 
+        internal static string BuildGetSamplesPostBody(
+            List<(int row, int col, double lat, double lon)> points, int start, int end)
+        {
+            var geometry = new StringBuilder("{\"points\":[");
+            for (int i = start; i < end; i++)
+            {
+                if (i > start) geometry.Append(',');
+                geometry.Append('[').Append(points[i].lon.ToString("F7", Inv)).Append(',')
+                        .Append(points[i].lat.ToString("F7", Inv)).Append(']');
+            }
+            // Without this, ArcGIS interprets the coordinates in the image service's spatial reference.
+            geometry.Append("],\"spatialReference\":{\"wkid\":4326}}");
+            return "geometry=" + Uri.EscapeDataString(geometry.ToString()) +
+                   "&geometryType=esriGeometryMultipoint" +
+                   "&returnFirstValueOnly=false" +
+                   "&interpolation=RSP_BilinearInterpolation" +
+                   "&f=json";
+        }
+
         /// <summary>
-        /// Writes the elevations of one getSamples response into <paramref name="result"/> and returns
-        /// how many of the <c>end - start</c> requested points received a real value.
+        /// Writes the elevations of one getSamples response into <paramref name="result"/>.
+        /// Throws if any requested point has no usable value, so the next source is tried instead.
         /// <para>
         /// The request uses <c>returnFirstValueOnly=false</c>, so where rasters overlap the server returns
         /// one sample per raster for the same point.  Counting "value" tokens would then shift every later
@@ -736,7 +820,7 @@ namespace DeadEverywhere.FloridaGen
                 if (!float.TryParse(s.value,
                         System.Globalization.NumberStyles.Float,
                         System.Globalization.CultureInfo.InvariantCulture,
-                        out float val) || float.IsNaN(val) || float.IsInfinity(val) || val <= NoDataElevation)
+                        out float val) || !IsValidElevation(val))
                     continue;
 
                 var p = points[start + index];
@@ -744,6 +828,10 @@ namespace DeadEverywhere.FloridaGen
                 got[index] = true;
                 received++;
             }
+            if (received != got.Length)
+                throw new FormatException(
+                    $"getSamples returned usable elevations for {received} of {got.Length} requested points " +
+                    $"in batch {start + 1}-{end}. Missing data will not be replaced with sea level.");
             return received;
         }
 
@@ -758,11 +846,14 @@ namespace DeadEverywhere.FloridaGen
         private static List<(int id, string value)> ReadGetSamples(string json)
         {
             var list = new List<(int id, string value)>();
-            if (string.IsNullOrEmpty(json)) return list;
+            if (string.IsNullOrWhiteSpace(json))
+                throw new FormatException("getSamples returned an empty response.");
 
             int key = json.IndexOf("\"samples\"", StringComparison.Ordinal);
             int i   = key < 0 ? -1 : json.IndexOf('[', key);
-            if (i < 0) return list;
+            if (i < 0)
+                throw new FormatException(
+                    "getSamples returned no samples array. Response: " + json.Substring(0, Math.Min(300, json.Length)));
 
             i++;
             while (i < json.Length)
@@ -845,7 +936,7 @@ namespace DeadEverywhere.FloridaGen
 
         // ── Source 3: USGS EPQS individual point queries ──────────────────────────
 
-        private float[,] FetchViaEPQS(GeoBounds b, int res)
+        protected virtual float[,] FetchViaEPQS(GeoBounds b, int res)
         {
             // Sample at reduced resolution and bilinearly upsample to avoid
             // hundreds of HTTP requests while still capturing the terrain shape.
@@ -853,9 +944,6 @@ namespace DeadEverywhere.FloridaGen
             float[,] sparse = new float[SAMPLE_RES, SAMPLE_RES];
             int total = SAMPLE_RES * SAMPLE_RES;
             int done  = 0;
-
-            using var wc = new System.Net.WebClient();
-            wc.Headers["User-Agent"] = "UnityTerrainGenerator/1.0";
 
             for (int row = 0; row < SAMPLE_RES; row++)
             {
@@ -870,51 +958,31 @@ namespace DeadEverywhere.FloridaGen
                         $"EPQS fallback: point {done}/{total}…",
                         0.45f + 0.45f * (float)done / total);
 
-                    try
-                    {
-                        string url =
-                            "https://epqs.nationalmap.gov/v1/json" +
-                            $"?x={lon:F7}&y={lat:F7}&wkid=4326&units=Meters&includeDate=false";
-                        string response = wc.DownloadString(url);
-                        sparse[row, col] = ParseEPQSValue(response);
-                    }
-                    catch (Exception epqsEx)
-                    {
-                        // Log individual point failures at warning level and keep
-                        // the default 0 (sea level) for that sample.
-                        Debug.LogWarning(
-                            $"[FloridaTerrainGenerator] EPQS point ({lat:F5},{lon:F5}) failed: " +
-                            epqsEx.Message);
-                    }
+                    string url = "https://epqs.nationalmap.gov/v1/json" +
+                                 string.Format(Inv, "?x={0:F7}&y={1:F7}&wkid=4326&units=Meters&includeDate=false", lon, lat);
+                    string response = SyncHttpGet(url, timeoutSeconds: 30);
+                    sparse[row, col] = ParseEPQSValue(response);
                 }
             }
 
             return BilinearUpsample(sparse, SAMPLE_RES, SAMPLE_RES, res);
         }
 
-        private static float ParseEPQSValue(string json)
+        internal static float ParseEPQSValue(string json)
         {
-            // Response: {"value":"35.19"} or {"value":35.19}
-            int vi = json.IndexOf("\"value\"", StringComparison.Ordinal);
-            if (vi < 0) return 0f;
-
-            int colon = json.IndexOf(':', vi + 7);
-            if (colon < 0) return 0f;
-
-            int s = colon + 1;
-            while (s < json.Length && (json[s] == ' ' || json[s] == '"')) s++;
-
-            int e = s;
-            while (e < json.Length &&
-                   json[e] != '"' && json[e] != ',' &&
-                   json[e] != '}' && json[e] != ']')
-                e++;
-
-            string v = json.Substring(s, e - s).Trim();
-            return float.TryParse(v,
+            if (string.IsNullOrWhiteSpace(json))
+                throw new FormatException("EPQS returned an empty response.");
+            int start = json.IndexOf('{');
+            if (start < 0)
+                throw new FormatException("EPQS returned no elevation object.");
+            ReadGetSample(json, start, SkipJsonValue(json, start), out _, out string value);
+            if (!float.TryParse(value,
                 System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture,
-                out float val) ? SanitizeElevation(val) : 0f;
+                out float elevation) || !IsValidElevation(elevation))
+                throw new FormatException(
+                    "EPQS returned no usable elevation. Response: " + json.Substring(0, Math.Min(300, json.Length)));
+            return elevation;
         }
 
         // ── OSM Overpass JSON parsing ─────────────────────────────────────────────
@@ -998,7 +1066,6 @@ namespace DeadEverywhere.FloridaGen
                         usage      = OsmFirstTag(tags, "amenity", "shop", "tourism", "office", "leisure", "building:use")
                     };
                     buildings.Add(bldg);
-                    OnBuildingFootprintGenerated(bldg.footprint);
                 }
                 else
                 {
@@ -1041,6 +1108,9 @@ namespace DeadEverywhere.FloridaGen
 
             osmBuildings = buildings.ToArray();
             osmRoads     = roads.ToArray();
+            UpdateBuildingRoadDirections();
+            foreach (var building in osmBuildings)
+                OnBuildingFootprintGenerated(building.footprint);
         }
 
         /// <summary>
@@ -1391,7 +1461,7 @@ namespace DeadEverywhere.FloridaGen
         // ── Road planning & mesh generation ───────────────────────────────────────
 
         private const string HwyMatDir =
-            "Assets/[Tools]/FloridaGen/Materials";
+            "Assets/[DeadEverywhere]/FloridaGen/Materials";
 
         [NonSerialized] private RoadPlan _roadPlan;
 
@@ -1456,6 +1526,7 @@ namespace DeadEverywhere.FloridaGen
                 deckSmoothingRadius = roadDeckSmoothingRadius,
                 deckClosingRadius   = roadDeckClosingRadius,
                 surfaceOffset       = roadSurfaceOffset,
+                widthAdjustment     = roadWidthAdjustment,
                 groundHeight        = TerrainSurfaceY
             };
             return FloridaRoadTranslator.Translate(osmRoads, BuildRoadObstacles(), cfg);
@@ -1508,8 +1579,9 @@ namespace DeadEverywhere.FloridaGen
         /// that lead onto a bridge onto an approach embankment.  <see cref="FloridaRoadMeshBuilder"/> then
         /// builds the geometry: ground roads with embankments and barriers, bridges as solid decks with
         /// barriers and piers, and tunnels as closed tubes.  Everything is batched into a handful of
-        /// meshes, each with a standard <see cref="MeshCollider"/>; Unity Physics bakes it like any other
-        /// static collider when the object is placed in an ECS SubScene.
+        /// meshes, each with a standard <see cref="MeshCollider"/> and a
+        /// <see cref="RoadEcsColliderAuthoring"/> that adds it to every ECS game world at play time.
+        /// Keep these GameObjects outside ECS SubScenes.
         /// </summary>
         public void GenerateHighwayMeshes()
         {
@@ -1526,7 +1598,7 @@ namespace DeadEverywhere.FloridaGen
             var terrainPos = transform.position;
 
             if (!AssetDatabase.IsValidFolder(HwyMatDir))
-                AssetDatabase.CreateFolder("Assets/[Tools]/FloridaGen", "Materials");
+                AssetDatabase.CreateFolder("Assets/[DeadEverywhere]/FloridaGen", "Materials");
 
             InvalidateRoadPlan();
             var plan = GetRoadPlan();
@@ -1554,6 +1626,7 @@ namespace DeadEverywhere.FloridaGen
                 go.AddComponent<MeshFilter>().sharedMesh = mesh;
                 go.AddComponent<MeshRenderer>().sharedMaterial = GetOrCreateHighwayMaterial(matName, color);
                 go.AddComponent<MeshCollider>().sharedMesh = mesh;
+                go.AddComponent<RoadEcsColliderAuthoring>();
                 Undo.RegisterCreatedObjectUndo(go, "Generate Highway Meshes");
                 objects++;
             }
@@ -1624,25 +1697,26 @@ namespace DeadEverywhere.FloridaGen
 
         /// <summary>
         /// Writes every fetched building to a text file, one building per line:
-        /// <c>id|type|levels|centerX|groundY|centerZ|area|x,z;x,z;…</c>
+        /// <c>id|type|levels|centerX|groundY|centerZ|area|x,z;x,z;…|height|nearestRoadDirection|nearestRoadBearing</c>
         /// (world-space metres, invariant culture). A single leading '#' line
         /// documents the format; lines starting with '#' should be ignored by readers.
+        /// Height is the OSM height in metres (0 when unknown); the original nine columns are unchanged.
+        /// Bearings are clockwise degrees from north (+Z); unknown directions use unknown|-1.00.
         /// </summary>
         public int SaveBuildingData(string path)
         {
             if (osmBuildings == null || osmBuildings.Length == 0) return 0;
+            UpdateBuildingRoadDirections();
             var terrain = GetComponent<Terrain>();
             var inv = System.Globalization.CultureInfo.InvariantCulture;
             var sb = new StringBuilder();
-            sb.Append($"# chunk={chunkX},{chunkY} format=id|type|levels|centerX|groundY|centerZ|area|x,z;x,z;...\n");
+            sb.Append($"# chunk={chunkX},{chunkY} format=id|type|levels|centerX|groundY|centerZ|area|x,z;x,z;...|height|nearestRoadDirection|nearestRoadBearing height=metres(0=unknown) bearing=degrees_clockwise_from_north unknown=unknown,-1.00\n");
             int count = 0;
             foreach (var b in osmBuildings)
             {
                 if (b?.footprint == null || b.footprint.Length < 3) continue;
-                Vector2 c = Vector2.zero; float area = 0f;
+                Vector2 c = BuildingCenter(b.footprint); float area = 0f;
                 int m = b.footprint.Length;
-                foreach (var v in b.footprint) c += v;
-                c /= m;
                 for (int i = 0; i < m; i++)
                 {
                     Vector2 a = b.footprint[i], d = b.footprint[(i + 1) % m];
@@ -1665,7 +1739,10 @@ namespace DeadEverywhere.FloridaGen
                     sb.Append(b.footprint[i].x.ToString("F2", inv)).Append(',')
                       .Append(b.footprint[i].y.ToString("F2", inv));
                 }
-                sb.Append('\n');
+                sb.Append('|').Append(b.height.ToString("R", inv))
+                  .Append('|').Append(b.nearestRoadDirection).Append('|')
+                  .Append((Mathf.Round(b.nearestRoadBearing * 100f) / 100f % 360f).ToString("F2", inv))
+                  .Append('\n');
                 count++;
             }
             System.IO.File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
@@ -1716,7 +1793,7 @@ namespace DeadEverywhere.FloridaGen
         }
 
         /// <summary>
-        /// Writes the building export (<see cref="SaveBuildingData"/>, format unchanged) to
+        /// Writes the building export (<see cref="SaveBuildingData"/>, including height and road direction) to
         /// <see cref="GetBuildingFilePath"/> and imports it.  Returns the number of buildings written.
         /// </summary>
         public int SaveBuildingDataFile()
@@ -1740,6 +1817,7 @@ namespace DeadEverywhere.FloridaGen
         /// <summary>Snapshot of the terrain heights and every fetched OSM feature.</summary>
         public FloridaChunkData CaptureChunkData()
         {
+            UpdateBuildingRoadDirections();
             var data = new FloridaChunkData
             {
                 savedUtc                = DateTime.UtcNow.ToString("o", Inv),
@@ -1751,6 +1829,7 @@ namespace DeadEverywhere.FloridaGen
                 roadDeckSmoothingRadius = roadDeckSmoothingRadius,
                 roadDeckClosingRadius   = roadDeckClosingRadius,
                 roadSurfaceOffset       = roadSurfaceOffset,
+                roadWidthAdjustment     = roadWidthAdjustment,
                 buildings               = osmBuildings   ?? new OsmBuilding[0],
                 roads                   = osmRoads       ?? new OsmRoad[0],
                 waterways               = osmWaterways   ?? new OsmWaterway[0],
@@ -1801,6 +1880,7 @@ namespace DeadEverywhere.FloridaGen
             roadDeckSmoothingRadius = data.roadDeckSmoothingRadius;
             roadDeckClosingRadius   = data.roadDeckClosingRadius;
             roadSurfaceOffset       = data.roadSurfaceOffset;
+            roadWidthAdjustment     = data.roadWidthAdjustment;
 
             if (data.elevations.Length > 0)
             {
@@ -1809,9 +1889,9 @@ namespace DeadEverywhere.FloridaGen
                 float[,] grid = FloridaChunkFile.ToGrid(data.elevations, data.heightmapResolution);
                 if (res != data.heightmapResolution)
                     grid = BilinearUpsample(grid, data.heightmapResolution, data.heightmapResolution, res);
-                ApplyToTerrain(grid);
                 if (autoPosition)
                     transform.position = ChunkWorldPosition(chunkX, chunkY);
+                ApplyToTerrain(grid);
             }
 
             osmBuildings   = data.buildings;
@@ -1820,6 +1900,7 @@ namespace DeadEverywhere.FloridaGen
             osmRailways    = data.railways;
             osmWaterBodies = data.waterBodies;
             osmNodes       = data.nodes;
+            UpdateBuildingRoadDirections();
             foreach (var b in osmBuildings)
                 if (b?.footprint != null) OnBuildingFootprintGenerated(b.footprint);
 
@@ -1850,12 +1931,21 @@ namespace DeadEverywhere.FloridaGen
         private const float NoDataElevation = -1000f;
 
         /// <summary>
-        /// Cleans a downloaded elevation (m).  NoData sentinels and non-finite values become
-        /// 0 (sea level); real below-sea-level values are kept, because the terrain is offset
-        /// by -maxTerrainHeight/2 precisely so it can go below sea level as well as above.
+        /// Zero and real below-sea-level values are valid. Missing data is never treated as sea level.
         /// </summary>
-        private static float SanitizeElevation(float v) =>
-            float.IsNaN(v) || float.IsInfinity(v) || v <= NoDataElevation ? 0f : v;
+        private static bool IsValidElevation(float v) =>
+            !float.IsNaN(v) && !float.IsInfinity(v) && v > NoDataElevation;
+
+        internal static float[,] ValidateElevationGrid(float[,] elevations, int res, string source)
+        {
+            if (res < 2 || elevations == null || elevations.GetLength(0) != res || elevations.GetLength(1) != res)
+                throw new FormatException($"{source} did not return a complete {res} x {res} elevation grid.");
+            for (int row = 0; row < res; row++)
+                for (int col = 0; col < res; col++)
+                    if (!IsValidElevation(elevations[row, col]))
+                        throw new FormatException($"{source} returned a missing or invalid elevation at row {row}, column {col}.");
+            return elevations;
+        }
 
         // ── Parsing ───────────────────────────────────────────────────────────────
 
@@ -1863,6 +1953,7 @@ namespace DeadEverywhere.FloridaGen
         /// Parses an Arc/Info ASCII Grid (AAIGrid) string into a 2-D float array
         /// with row 0 = south (matching Unity's terrain heightmap layout) and
         /// resamples it to <paramref name="targetRes"/> × <paramref name="targetRes"/>.
+        /// Rejects truncated grids and NoData instead of inserting sea-level samples.
         /// </summary>
         internal static float[,] ParseAAIGrid(string text, int targetRes)
         {
@@ -1872,27 +1963,30 @@ namespace DeadEverywhere.FloridaGen
             ParseAAIGridHeader(lines,
                 out int ncols, out int nrows, out float nodata, out int dataLine);
 
-            if (ncols == 0 || nrows == 0)
-                throw new Exception(
+            if (ncols < 2 || nrows < 2)
+                throw new FormatException(
                     $"AAIGrid parse error: ncols={ncols} nrows={nrows}");
+            if (lines.Length - dataLine < nrows)
+                throw new FormatException("AAIGrid response is missing elevation rows.");
 
             // Read raw elevation values.
             // AAIGrid: row 0 = northernmost row, row nrows-1 = southernmost.
             float[,] raw = new float[nrows, ncols];
-            for (int r = 0; r < nrows && dataLine + r < lines.Length; r++)
+            for (int r = 0; r < nrows; r++)
             {
                 string[] vals = lines[dataLine + r].Trim().Split(
                     new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
 
-                for (int c = 0; c < ncols && c < vals.Length; c++)
+                if (vals.Length != ncols)
+                    throw new FormatException($"AAIGrid row {r} has {vals.Length} elevations; expected {ncols}.");
+                for (int c = 0; c < ncols; c++)
                 {
-                    if (float.TryParse(vals[c],
+                    if (!float.TryParse(vals[c],
                             System.Globalization.NumberStyles.Float,
                             System.Globalization.CultureInfo.InvariantCulture,
-                            out float v))
-                    {
-                        raw[r, c] = v <= nodata ? 0f : SanitizeElevation(v);
-                    }
+                            out float v) || v == nodata || !IsValidElevation(v))
+                        throw new FormatException($"AAIGrid returned a missing or invalid elevation at row {r}, column {c}.");
+                    raw[r, c] = v;
                 }
             }
 
@@ -2020,6 +2114,7 @@ namespace DeadEverywhere.FloridaGen
             var  td      = terrain.terrainData;
             int  res     = (int)heightmapResolution;
             float tileM  = (float)MILES_TO_METERS;   // 1609.344 m
+            ValidateElevationGrid(elevations, res, "Terrain");
 
 #if UNITY_EDITOR
             Undo.RecordObject(td, "Generate Florida Terrain Chunk");
@@ -2050,6 +2145,7 @@ namespace DeadEverywhere.FloridaGen
                     $"terrain range of \u00b1{halfHeight:F0} m and were clamped. Increase maxTerrainHeight.");
 
             td.SetHeights(0, 0, heights);
+            EnsureTerrainEcsCollider().RebuildCollider();
 
 #if UNITY_EDITOR
             EditorUtility.SetDirty(td);
@@ -2083,6 +2179,7 @@ namespace DeadEverywhere.FloridaGen
                 for (int c = 0; c < res; c++)
                     clearHeights[r, c] = seaLevel;
             td.SetHeights(0, 0, clearHeights);
+            EnsureTerrainEcsCollider().RebuildCollider();
 
             statusMessage = "Terrain cleared.";
 
@@ -2136,9 +2233,10 @@ namespace DeadEverywhere.FloridaGen
             return Task.Run(async () =>
             {
                 var client  = GetHttpClient(timeoutSeconds);
-                var content = new StringContent(
+                using var content = new StringContent(
                     body, Encoding.UTF8, "application/x-www-form-urlencoded");
-                var response = await client.PostAsync(url, content).ConfigureAwait(false);
+                using var response = await client.PostAsync(url, content).ConfigureAwait(false);
+                response.EnsureSuccessStatusCode();
                 return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
             }).GetAwaiter().GetResult();
         }

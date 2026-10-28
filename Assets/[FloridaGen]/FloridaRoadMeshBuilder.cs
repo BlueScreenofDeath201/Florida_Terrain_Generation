@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 
-namespace DeadEverywhere.FloridaGen
+namespace DeadEverywhere.FloridaGeneration
 {
     /// <summary>
     /// Accumulates geometry for many roads into one mesh (32-bit indices) so a chunk

@@ -1,4 +1,4 @@
 ﻿<Solution>
-  <Project Path="Assembly-CSharp.csproj" />
-  <Project Path="Assembly-CSharp-Editor.csproj" />
+  <Project Path="DeadEverywhere.FloridaGeneration.Editor.csproj" />
+  <Project Path="DeadEverywhere.FloridaGeneration.csproj" />
 </Solution>

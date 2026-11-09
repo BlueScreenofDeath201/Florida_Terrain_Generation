@@ -1,0 +1,22 @@
+{
+    "name": "DeadEverywhere.FloridaGeneration.Editor",
+    "rootNamespace": "DeadEverywhere.FloridaGeneration.Editor",
+    "references": [
+        "DeadEverywhere.FloridaGeneration",
+        "Unity.Entities",
+        "Unity.Collections",
+        "Unity.Physics",
+        "Unity.Transforms"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
